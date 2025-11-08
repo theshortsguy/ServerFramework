@@ -1721,6 +1721,74 @@ class AbstractBLLManager(ABC):
                 validated_fields.append(field_name)
 
         return validated_fields
+    
+    def validate_fields(self, fields: Optional[Union[List[str], str]]) -> Optional[List[str]]:
+        """
+        Validate that requested fields exist in the model.
+        Returns the processed fields list.
+        Raises HTTPException 422 if invalid fields are provided.
+        
+        Args:
+            fields: List of field names or CSV string of field names
+            
+        Returns:
+            Processed list of valid field names, or None/empty list if no fields provided
+            
+        Raises:
+            HTTPException: 422 status if invalid fields are detected
+        """
+        if not fields:
+            return fields
+        
+        # Parse fields - handle both CSV strings and lists
+        fields_list = self._parse_fields(fields)
+        
+        if not fields_list:
+            return fields_list
+        
+        # Get valid field names from the model
+        valid_fields = set(self.Model.model_fields.keys())
+        
+        # Check for invalid fields
+        provided_fields = set(fields_list)
+        invalid_fields = provided_fields - valid_fields
+        
+        if invalid_fields:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "error": "Invalid fields provided",
+                    "invalid_fields": sorted(list(invalid_fields)),
+                    "valid_fields": sorted(list(valid_fields))
+                }
+            )
+        
+        return fields_list
+    
+    def validate_includes(self, includes: Optional[Union[List[str], str]]) -> Optional[List[str]]:
+        """
+        Validate that requested includes exist as valid relationships for the model.
+        
+        This is a lightweight wrapper that uses generate_joins() for validation
+        without actually generating the join options.
+        """
+        if not includes:
+            return includes
+
+        includes_list = self._parse_includes(includes)
+        
+        if not includes_list:
+            return includes_list
+
+        # Use generate_joins() for validation - it will raise HTTPException if invalid
+        # We discard the result since we only care about validation here
+        try:
+            self.generate_joins(self.DB, includes_list)
+        except HTTPException:
+            # Re-raise the 422 error from generate_joins
+            raise
+        
+        return includes_list
 
     def _resolve_load_only_columns(self, fields_list: List[str]) -> List[Any]:
         """Resolve field names to SQLAlchemy load_only compatible attributes."""
@@ -1799,9 +1867,45 @@ class AbstractBLLManager(ABC):
         Returns:
             List of SQLAlchemy joinedload options
         """
+        """Generate join loads based on specified include fields."""
+        from sqlalchemy.orm import RelationshipProperty
+        from lib.Logging import logger
+        from fastapi import HTTPException, status
         from lib.Logging import logger
 
         joins = []
+        invalid_includes = []
+        valid_relationships = []
+
+        # Collect all valid relationships - try multiple detection methods
+        try:
+            # Method 1: Check __mapper__ (SQLAlchemy 1.x and 2.x)
+            if hasattr(model_class, '__mapper__'):
+                mapper = model_class.__mapper__
+                if hasattr(mapper, 'relationships'):
+                    for rel_name in mapper.relationships.keys():
+                        valid_relationships.append(rel_name)
+        except Exception as e:
+            logger.debug(f"Could not get relationships from __mapper__: {e}")
+
+        # Method 2: Check via dir() and property inspection (fallback)
+        if not valid_relationships:
+            for attr_name in dir(model_class):
+                if attr_name.startswith('_'):
+                    continue
+                try:
+                    attr = getattr(model_class, attr_name)
+                    # Check if it's a SQLAlchemy relationship
+                    if hasattr(attr, 'property'):
+                        if isinstance(attr.property, RelationshipProperty):
+                            valid_relationships.append(attr_name)
+                        elif hasattr(attr.property, 'mapper'):
+                            valid_relationships.append(attr_name)
+                except Exception:
+                    continue
+
+        # Remove duplicates
+        valid_relationships = sorted(list(set(valid_relationships)))
 
         # Helper: resolve a single attribute name to an actual relationship attribute
         def _resolve_relationship_attribute(cls, name):
@@ -2081,11 +2185,12 @@ class AbstractBLLManager(ABC):
         if fields:
             from sqlalchemy.orm import load_only
 
-            fields_list = self._parse_fields(fields)
+            fields_list = self.validate_fields(fields)
             if fields_list:
                 columns = self._resolve_load_only_columns(fields_list)
                 if columns:
                     options.append(load_only(*columns))
+                    
 
         # Filter out hook-related parameters before passing to database
         db_kwargs = {k: v for k, v in kwargs.items() if k not in ["hook_processed"]}
@@ -2141,7 +2246,7 @@ class AbstractBLLManager(ABC):
         if fields:
             from sqlalchemy.orm import load_only
 
-            fields_list = self._parse_fields(fields)
+            fields_list = self.validate_fields(fields)
             if fields_list:
                 columns = self._resolve_load_only_columns(fields_list)
                 if columns:
@@ -2155,6 +2260,16 @@ class AbstractBLLManager(ABC):
                     order_by = [asc(column)]
                 else:
                     order_by = [desc(column)]
+            else:
+                valid_fields = set(self.Model.model_fields.keys())
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": f"Invalid sort_by field: '{sort_by}'",
+                        "invalid_field": sort_by,
+                        "valid_fields": sorted(list(valid_fields))
+                    }
+                )
 
         # Generate filters from complex search_params only
         search_filters = self.build_search_filters(complex_search_params)
@@ -2228,7 +2343,7 @@ class AbstractBLLManager(ABC):
         if fields:
             from sqlalchemy.orm import load_only
 
-            fields_list = self._parse_fields(fields)
+            fields_list = self.validate_fields(fields)
             if fields_list:
                 columns = self._resolve_load_only_columns(fields_list)
                 if columns:

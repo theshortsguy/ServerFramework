@@ -302,6 +302,11 @@ def create_query_model_dependency(
         for raw_key, raw_value in request.query_params.multi_items():
             normalized_key = _normalize_query_key(raw_key)
             field_name = alias_map.get(normalized_key, normalized_key)
+            if field_name is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Unexpected query parameter '{raw_key}"
+                )
             raw_values.setdefault(field_name, []).append(raw_value)
 
         parsed: Dict[str, Any] = {}
@@ -317,8 +322,10 @@ def create_query_model_dependency(
                 parsed[field_name] = _coerce_sequence_values(values)
             else:
                 parsed[field_name] = values[-1]
-
-        return model_cls(**parsed)
+        try:
+            return model_cls(**parsed)
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=e.errors())
 
     return dependency
 
@@ -1618,6 +1625,23 @@ def register_route(
                     getattr(query_params, "fields", None)
                 )
 
+                if fields_param:
+                    # Get valid field names from the target model
+                    valid_fields = set(target_model.model_fields.keys())
+                
+                    # Check for invalid fields
+                    invalid_fields = [f for f in fields_param if f not in valid_fields]
+                
+                    if invalid_fields:
+                        raise HTTPException(
+                            status_code=422,
+                            detail={
+                                "error": f"Invalid fields requested: {', '.join(invalid_fields)}",
+                                "invalid_fields": invalid_fields,
+                                "valid_fields": sorted(list(valid_fields))
+                            }
+                        )
+
                 result = get_manager(manager, manager_property).get(
                     id=id, include=include_param, fields=fields_param
                 )
@@ -1786,6 +1810,23 @@ def register_route(
                 fields_param = _normalize_query_list(
                     getattr(query_params, "fields", None)
                 )
+
+                if fields_param:
+                    # Get valid field names from the target model
+                    valid_fields = set(target_model.model_fields.keys())
+                    
+                    # Check for invalid fields
+                    invalid_fields = [f for f in fields_param if f not in valid_fields]
+                    
+                    if invalid_fields:
+                        raise HTTPException(
+                            status_code=422,
+                            detail={
+                                "error": f"Invalid fields requested: {', '.join(invalid_fields)}",
+                                "invalid_fields": invalid_fields,
+                                "valid_fields": sorted(list(valid_fields))
+                            }
+                        )
 
                 results = get_manager(manager, manager_property).list(
                     include=include_param,
